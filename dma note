@@ -1,0 +1,514 @@
+内存映射与DMA笔记 
+　　http://hi.baidu.com/zhxust/blog/item/61b74db1ddbadd5d0823027f.html 
+　　3项技术： 
+　　1,mmap系统调用可以实现将设备内存映射到用户进程的地址空间。 
+　　2,使用get_user_pages,可以把用户空间内存映射到内核中。 
+　　3,DMA的I/O操作，使得外设具有直接访问系统内存的能力。 
+　　------------- 
+　　内存管理 
+　　内核用来管理内存的数据结构 
+　　--------- 
+　　地址内型 
+　　Linux是一个虚拟内存系统，即用户程序使用的地址与硬件使用的物理地址是不等同的。 
+　　虚拟内存引入了一个间接层，使得许多操作成为可能： 
+　　*有了虚拟内存，系统中运行的程序可以分配比物理内存更多的内存。 
+　　*虚拟地址还能让程序在进程的地址空间内使用更多的技巧，包括将程序的内存映射到设备内存上。 
+　　地址内型列表 
+　　*用户虚拟地址 每个进程都有自己的虚拟地址空间。 
+　　*物理地址 处理器访问系统内存时使用的地址。 
+　　*总线地址 在外围总线和内存之间使用。MMU可以实现总线和主内存之间的重新映射。 
+　　当设置DMA操作时，编写MMU相关的代码是一个必需的步骤。 
+　　*内核逻辑地址 
+　　内核逻辑地址组成了内核的常规地址空间，该地址映射了部分（或全部）内存， 
+　　并经常被视为物理地址。在大多数体系架构中，逻辑地址与其相关联的物理地址 
+　　的不同，仅仅在于它们之间存在一个固定的偏移量。kmalloc返回的内存就是 
+　　内核逻辑地址。 
+　　*内核虚拟地址 
+　　内核虚拟地址与逻辑地址相同之处在于，都将内核空间的地址映射到物理地址上。 
+　　不同之处在于，内核虚拟地址与物理地址的映射不是线性的和一对一的。 
+　　vmalloc返回一个虚拟地址，kmap函数也返回一个虚拟地址。 
+　　------------------ 
+　　物理地址和页 
+　　物理地址被分为离散的单元，称之为页。 
+　　系统内部许多对内存的操作都是基于单个页的。 
+　　大多数系统都使用每页4096个字节，PAGE_SIZE 给出指定体系架构下的页大小。 
+　　观察内存地址，无论是虚拟的还是物理的，它们都被分为页号和一个页内的偏移量。 
+　　如果每页4096个字节，那么最后的12位就是偏移量，剩余的高位则指定页号。 
+　　页帧数：将除去偏移量的剩余位移到右端，称该结果为页帧数。 
+　　------------------- 
+　　高端与低端内存 
+　　内核(在x86架构中)将4GB的虚拟地址空间分割为用户空间和内核空间。 
+　　一个典型的分割是将3GB分配给用户空间，1GB分配给内核空间。 
+　　占用内核地址空间最大的部分是物理内存的虚拟映射， 
+　　内核无法直接操作没有映射到内核地址空间的内存。 
+　　低端内存： 
+　　只有内存的低端部分拥有逻辑地址。内核的数据结构必须放置在低端内存中。 
+　　高端内存： 
+　　除去低端内存的剩余部分没有逻辑地址。它们处于内核虚拟地址之上。 
+　　-------------------- 
+　　内存映射和页结构 
+　　内核使用逻辑地址来引用物理内存中的页。 
+　　为解决在高端内存中无法使用逻辑地址的问题，内核中处理内存的函数趋向于使用 
+　　指向page结构的指针。 
+　　page结构用来保存内核需要知道的所有物理内存信息，对系统中的每个物理页， 
+　　都有一个page结构相对应。 
+　　----- 
+　　page结构的几个成员： 
+　　atomic_t count; 对该页的访问计数。 
+　　void *virtual; 如果页面被映射，则指向页的内核虚拟地址； 
+　　如果未被映射，则为NULL。 
+　　低端内存页总是被映射，而高端内存页通常不被映射。 
+　　unsigned long flags; 描述页状态的一系列标志。 
+　　PG_locked表示内存中的页已经被锁住， 
+　　而PG_reserved表示禁止内存管理系统访问该页。 
+　　----- 
+　　内核维护了一个或者多个page结构的数组，用来跟踪系统中的物理内存。 
+　　----- 
+　　有一些函数和宏用来在page结构指针与虚拟地址之间进行转换： 
+　　struct page *virt_to_page(void *kaddr); 
+　　将内核逻辑地址转换为响应的page结构指针。 
+　　struct page *pfn_to_page(int pfn); 
+　　针对给定的页帧号，返回page结构指针。 
+　　void *page_address(struct page *page); 
+　　如果地址存在的话，则返回页的内核虚拟地址。 
+　　void *kmap(struct page *page); 
+　　为系统中的页返回内核虚拟地址。 
+　　对于低端内存页，它只返回页的逻辑地址； 
+　　对于高端内存页，kmap在专用的内核地址空间创建特殊的映射。 
+　　void kunmap(struct page *page); 
+　　释放由kmap创建的映射。 
+　　void *kmap_atomic(struct page *page,enum km_type type); 
+　　void kunmap_atomic(void *addr,enum km_type type); 
+　　, 
+　　是kmap的高性能版本。 
+　　------- 
+　　页表 
+　　在任何现代的系统中，处理器必须使用某种机制，将虚拟地址转化为响应的物理地址， 
+　　这种机制成为页表。 
+　　------- 
+　　虚拟内存区 
+　　虚拟内存区(VMA)用于管理进程地址空间中不同区域的内核数据结构。 
+　　可以将其描述为“拥有自身属性的内存对象”。 
+　　进程的内存映射包含下面这些区域： 
+　　*可执行代码区域 
+　　*多个数据区：初始化数据，非初始化数据(BSS),程序堆栈。 
+　　*与每个活动的内存映射对应的区域 
+　　#cat /proc/1/maps 
+　　可以了解进程的内存区域。 
+　　/proc/self始终指向当前进程。 
+　　每行都是用下面的形式表示的： 
+　　start-end perm offset major:minor inode image 
+　　在/proc/*/maps中的每个成员(除映像名外)都与vm_area_struct结构中的一个成员对应： 
+　　start 
+　　end 
+　　该内存区域的起始处和结束处的虚拟地址。 
+　　perm 
+　　读、写和执行权限，最后一位若是p表示私有，s表示共享。 
+　　offset 
+　　内存区域在映射文件中的起始位置。 
+　　major 
+　　minor 
+　　拥有映射文件的设备的主设备号和次设备号。 
+　　inode 
+　　被映射的文件的索引节点号。 
+　　image 
+　　被映射文件的名称。 
+　　------------- 
+　　vm_area_struct结构 
+　　当用户空间进程调用mmap，将设备内存映射到它的地址空间时， 
+　　系统通过创建一个表示该映射的新VMA作为响应。 
+　　支持mmap的驱动程序需要帮助进城完成VMA的初始化。 
+　　vm_area_struct结构是在中定义的。 
+　　VMA的主要成员如下： 
+　　unsigned long vm_start; 
+　　unsigned long vm_end; 
+　　该VMA所覆盖的虚拟地址范围。 
+　　struct file *vm_file; 
+　　指向与该区域相关联的file结构指针。 
+　　unsigned long vm_pgoff; 
+　　以页为单位，文件中该区域的偏移量。 
+　　unsigned long vm_flags; 
+　　描述该区域的一套标志。 
+　　struct vm_operations_struct *vm_ops; 
+　　内核能调用的一套函数，用来对该内存区进行操作。 
+　　它的存在表示内存区域是一个内核“对象”。 
+　　void *vm_private_data; 
+　　驱动程序用来保存自身信息的成员。 
+　　vm_operations_struct结构的几个成员： 
+　　void (*open)(struct vm_area_struct *vma); 
+　　void (*close)(struct vm_area_struct *vma); 
+　　struct page *(*nopage)(struct vm_area_struct *vma, 
+　　unsigned long address,int *type); 
+　　int (*populate)(struct vm_area_struct *vm, 
+　　unsigned long address,unsigned long len, 
+　　pgprot_t prot,unsigned long pgoff,int nonblock); 
+　　-------------------------- 
+　　内存映射处理 
+　　在系统中的每个进程都拥有一个struct mm_struct结构, 
+　　其中包含了虚拟内存区域链表、页表以及其他大量内存管理信息， 
+　　还包含一个信号灯(mmap_sem)和一个自旋锁(page_table_lock)。 
+　　----- 
+　　mmap设备操作 
+　　对于驱动程序来说，内存映射可以提供给用户程序直接访问设备内存的能力。 
+　　映射一个设备意味着将用户空间的一段内存与设备内存关联起来。 
+　　无论何时当程序在分配的地址范围内读写时，实际上访问的就是设备。 
+　　要注意： 
+　　像串口和其它面向流的设备不能进行mmap抽象。 
+　　必须以PAGE_SIZE为单位进行映射。 
+　　--------- 
+　　rmpap_pfn_range和io_remap_page_range为一段物理地址建立新的页表。 
+　　int remap_pfn_range(struct vm_area_struct *vm, 
+　　unsigned long virt_addr,unsigned long pfn, 
+　　unsigned long size,pgprot_t prot); 
+　　int io_remap_page_range(struct vm_area_struct *vma, 
+　　unsigned long virt_addr,unsigned long phys_addr, 
+　　unsigned long size,pgprot_t prot); 
+　　vma:虚拟内存区域，在一定范围内的页将被映射到该区域内。 
+　　virt_addr:重新映射时的起始用户虚拟地址。该函数为处于virt_addr和virt_addr+size 
+　　之间的虚拟地址建立页表。 
+　　pfn:与物理内存对应的页帧号，虚拟内存将要被映射到该物理内存上。 
+　　size:以字节为单位，被重新映射的区域大小。 
+　　prot:新VMA要求的"保护"属性。 
+　　------------ 
+　　一个简单的实现 
+　　static int simple_remap_mmap(struct file *filp,struct vm_area_struct *vma) 
+　　{ 
+　　if(remap_pfn_range(vma,vma->vm_start,vma->vm_pgoff, 
+　　vma->vm_end-vma->vm->vm_start,vma->vm_page_prot)) 
+　　return -EAGAIN; 
+　　vma->vm_ops = &simple_remap_vm_ops; 
+　　simple_vma_open(vma); 
+　　return 0; 
+　　} 
+　　可见，重新映射内存就是调用remap_pfn_range函数创建所需的页表。 
+　　-------------- 
+　　为VMA添加操作 
+　　vm_area_struct结构包含了一系列针对VMA的操作。 
+　　void simple_vma_open(struct vm_area_struct *vma) 
+　　{ 
+　　printk(KERN_NOTICE "Simple VMA open,virt %lx,phys %lx\n", 
+　　vma->vm_start,vma->vm_pgoff 内存 
+　　有时驱动程序对mmap的实现必须具有更好的灵活性，在这种情况下， 
+　　提倡使用VMA的nopage方法实现内存映射。 
+　　如果要支持mremap系统调用，就必须实现nopage函数。 
+　　struct page *(*nopage)(struct vm_area_struct *vma, 
+　　unsigned long address,int *type); 
+　　----------------- 
+　　重映射特定的I/O区域 
+　　一个典型的驱动程序只映射与其外围设备相关的一小段地址，而不是映射全部地址。 
+　　----------------- 
+　　重新映射RAM 
+　　-- 
+　　使用nopage方法重映射RAM 
+　　-- 
+　　重新映射内核虚拟地址 
+　　------------------- 
+　　执行直接I/O访问 
+　　实现直接I/O的关键是get_user_pages()函数： 
+　　int get_user_pages(struct task_struct *tsk,struct mm_struct *mm, 
+　　unsigned long start,int len,int write,int force, 
+　　struct page **pages,struct vm_area_struct **vmas); 
+　　---------- 
+　　异步I/O 
+　　 
+　　ssize_t (*aio_read)(),ssize_t (*aio_write)(),ssize_t (*aio_fsync)() 
+　　------------------------------------------------------------ 
+　　直接内存访问      DMA 
+　　DMA是一种硬件机制，它允许外围设备和主内存之间直接传输它们的I/O数据， 
+　　而不需要系统处理器的参与。 
+　　-------------------------- 
+　　DMA数据传输概览 
+　　有两种方式引发数据传输： 
+　　1,软件对数据的请求,比如通过read函数。 
+　　2,硬件异步地将数据传递给系统。 
+　　第一种情况的步骤如下： 
+　　1)当进程调用read,驱动程序分配一个DMA缓冲区， 
+　　并让硬件将数据传输到这个缓冲区中。进程处于睡眠状态。 
+　　2)硬件将数据写入到DMA缓冲区中，当写入完毕，产生一个中断。 
+　　3)中断处理程序获得输入的数据，应答中断，并且唤醒进程， 
+　　该进程即可读取数据。 
+　　第二种情况发生在异步使用DMA时。 
+　　比如对于一个数据采集设备，即使没有进程读取数据，它也不断地写入数据。 
+　　此时，驱动程序应该维护一个缓冲区，其后的read调用将返回所有积累的数据给用户空间。 
+　　这种传输方式的步骤如下： 
+　　1)硬件产生中断，宣告新数据的到来。 
+　　2)中断处理程序分配一个缓冲区，并且告诉硬件向哪里传输数据。 
+　　3)外围设备将数据写入缓冲区，完成后产生另外一个中断。 
+　　4)处理程序分发新数据，唤醒任何相关进程，然后执行清理工作。 
+　　高效的DMA处理依赖于中断报告!!! 
+　　------------------ 
+　　分配DMA缓冲区 
+　　使用DMA缓冲区的主要问题是：当大于一页时，它们必须占据连续的物理页， 
+　　这是因为使用ISA或者PCI系统总线传输数据，而这两种方式使用的都是物理地址。 
+　　驱动程序作者必须谨慎地为DMA操作分配正确的内存类型，因为 
+　　并不是所有内存区间都适合DMA操作。 
+　　在实际操作中，一些设备和一些系统中的高端内存不能用于DMA， 
+　　这是因为外围设备不能使用高端内存的地址。 
+　　对于有限制的设备，应使用GFP_DMA标志调用kmalloc或者get_free_pages从 
+　　DMA区间分配内存。另外，还可以通过使用通用DMA层来分配缓冲区。 
+　　------------------- 
+　　总线地址 
+　　使用DMA的设备驱动程序将与连接到总线接口上的硬件通信， 
+　　硬件使用的是物理地址，而程序代码使用的是虚拟地址。 
+　　实际上，基于DMA的硬件使用总线地址，而非物理地址。 
+　　的一些函数提供了可移植的方案： 
+　　unsigned long virt_to_bus(volatile void *address); 
+　　void *bus_to_virt(unsigned long address); 
+　　这些函数在内核逻辑地址和总线地址间执行了简单的转换。 
+　　----------------------------------- 
+　　通用DMA层 
+　　DMA操作最终会分配缓冲区，并将总线地址传递给设备。 
+　　内核提供了一个与总线---体系架构无关的DMA层，它会隐藏大多数问题。 
+　　在编写驱动程序时，为DMA操作使用该层。 
+　　device结构 
+　　该结构是在Linux设备模型中用来表示设备底层的，驱动程序通常不直接使用该结构， 
+　　但是，在使用通用DMA层时，需要使用它。 
+　　该结构内部隐藏了描述设备的总线细节。 
+　　----------------- 
+　　处理复杂的硬件 
+　　是否给定的设备在当前主机上具备执行DMA操作的能力? 
+　　因为有的设备受限于24位寻址。可以用dma_set_mask()函数解决。 
+　　-------------------------- 
+　　DMA映射 
+　　一个DMA映射是要分配的DMA缓冲区与为该缓冲区生成的、设备可访问地址的组合。 
+　　DMA映射建立了一个新的结构类型---dma_addr_t来表示总线地址。 
+　　dma_addr_t类型的变量对驱动程序是不透明的， 
+　　唯一允许的操作是将它们传递给DMA支持例程以及设备本身。 
+　　根据DMA缓冲区期望保留的时间长短，PCI代码有两种DMA映射: 
+　　1)一致性映射 
+　　2)流式DMA映射(推荐) 
+　　---------------------------- 
+　　建立一致性DMA映射 
+　　void *dma_alloc_coherent(struct device *dev,size_t size, 
+　　dma_addr_t *dma_handle,int flag); 
+　　该函数处理了缓冲区的分配和映射。 
+　　前两个参数是device结构和所需缓冲区的大小。 
+　　函数在两处返回结果： 
+　　1)函数的返回值时缓冲区的内核虚拟地址，可以被驱动程序使用。 
+　　2)相关的总线地址则保存在dma_handle中。 
+　　向系统返回缓冲区 
+　　void dma_free_coherent(struct device *dev,size_t size, 
+　　void *vaddr,dma_addr_t dma_handle); 
+　　--------- 
+　　DMA池 
+　　DMA池是一个生成小型、一致性DMA映射的机制。 
+　　调用dma_alloc_coherent函数获得的映射，可能其最小大小为单个页。 
+　　如果设备需要的DMA区域比这还小，就要用DMA池了。 
+　　[/b] 
+　　[b]struct dma_pool *dma_pool_create(const char *name,struct device *dev, 
+　　size_t size,size_t align, 
+　　size_t allocation); 
+　　name是DMA池的名字，dev是device结构，size是从该池中分配的缓冲区大小， 
+　　align是该池分配操作所必须遵守的硬件对齐原则。 
+　　销毁DMA池 
+　　void dma_pool_destroy(struct dma_pool *pool); 
+　　DMA池分配内存 
+　　void *dma_pool_alloc(struct dma_pool *pool,int mem_flags, 
+　　dma_addr_t *handle); 
+　　释放内存 
+　　void dma_pool_free(struct dma_pool *pool,void *vaddr,dma_addr_t addr); 
+　　--------------------------- 
+　　建立流式DMA映射 
+　　流式映射具有比一致性映射更为复杂的接口。 
+　　这些映射希望能与已经由驱动程序分配的缓冲区协同工作， 
+　　因而不得不处理那些不是它们选择的地址。 
+　　当建立流式映射时，必须告诉内核数据流动的方向。 
+　　枚举类型dma_data_direction: 
+　　DMA_TO_DEVICE 数据发送到设备(如write系统调用) 
+　　DMA_FROM_DEVICE 数据被发送到CPU 
+　　DMA_BIDIRECTIONAL 数据可双向移动 
+　　DMA_NONE 出于调试目的。 
+　　当只有一个缓冲区要被传输的时候，使用dma_map_single函数映射它: 
+　　dma_addr_t dma_map_single(struct device *dev,void *buffer,size_t size, 
+　　enum dma_data_direction direction); 
+　　返回值是总线地址，可以把它传递给设备。 
+　　当传输完毕后，使用dma_unmap_single函数删除映射： 
+　　void dma_unmap_single(struct device *dev,dma_addr_t dma_addr,size_t size, 
+　　enum dma_data_direction direction); 
+　　流式DMA映射的几条原则: 
+　　*缓冲区只能用于这样的传送，即其传送方向匹配于映射时给定的方向。 
+　　*一旦缓冲区被映射，它将属于设备，而不是处理器。 
+　　直到缓冲区被撤销映射前，驱动程序不能以任何方式访问其中的内容。 
+　　*在DMA处于活动期间内，不能撤销对缓冲区映射，否则会严重破坏系统的稳定性。 
+　　驱动程序需要不经过撤销映射就访问流式DMA缓冲区的内容，有如下调用： 
+　　void dma_sync_single_for_cpu(struct device *dev,dma_handle_t bus_addr, 
+　　size_t size,enum dma_data_direction direction); 
+　　将缓冲区所有权交还给设备： 
+　　void dma_sync_single_for_device(struct device *dev,dma_handle_t bus_addr, 
+　　size_t size,enum dma_data_direction direction); 
+　　-------------------------- 
+　　单页流式映射 
+　　有时候，要为page结构指针指向的缓冲区建立映射，比如 
+　　为get_user_pages获得的用户空间缓冲区。 
+　　dma_addr_t dma_map_page(struct device *dev,struct page *page, 
+　　unsigned long offset,size_t size, 
+　　enum dma_data_direction direction); 
+　　void dma_unmap_page(struct device *dev,dma_addr_t dma_address, 
+　　size_t size,enum dma_data_direction direction); 
+　　--------------------------- 
+　　分散/聚集映射 
+　　有几个缓冲区，它们需要与设备双向传输数据。 
+　　可以简单地依次映射每一个缓冲区并且执行请求的操作， 
+　　但是一次映射整个缓冲区表还是很有利的。 
+　　映射分散表的第一步是建立并填充一个描述被传输缓冲区的 
+　　scatterlist结构的数组。 
+　　 
+　　scatterlist结构的成员： 
+　　struct page *page; 
+　　unsigned int length; 
+　　unsigned int offset; 
+　　映射 
+　　int dma_map_sg(struct device *dev,struct scatterlist *sg,int nents, 
+　　enum dma_data_direction direction); 
+　　解除 
+　　void dma_unmap_sg(struct device *dev,struct scatterlsit *list, 
+　　int nents,enum dma_data_direction direction); 
+　　-------------------------- 
+　　PCI双重地址周期映射 
+　　通用DMA支持层使用32位总线地址，然而PCI总线还支持64位地址模式，即 
+　　双重地址周期(DAC)。 
+　　通用DMA层并不支持该模式。 
+　　要使用PCI总线的DAC，必须设置一个单独的DMA掩码： 
+　　int pci_dac_set_dma_mask(struct pci_dev *pdev,u64 mask); 
+　　建立映射 
+　　dma64_addr_t pci_dac_page_to_dma(struct pci_dev *pdev,struct page *page, 
+　　unsigned long offset,int direction); 
+　　----------------------------- 
+　　一个简单的PCI DMA例子 
+　　这里提供了一个PCI设备的DMA例子dad(DMA Acquisition Device)的一部分，说明如何使用DMA映射： 
+　　int dad_transfer(struct dad_dev *dev,int write,void *buffer,size_t count) 
+　　{ 
+　　dma_addr_t bus_addr; 
+　　dev->dma_dir = (write ? DMA_TO_DEVICE : DMA_FROM_DEVICE); 
+　　dev->dma_size = count; 
+　　/*映射DMA需要的缓冲区*/ 
+　　bus_addr = dma_map_single(&dev->pci_dev->dev,buffer,count,dev->dma_dir); 
+　　writeb(dev->registers.command,DAD_CMD_DISABLEDMA); 
+　　writeb(dev->registers.command,write ? DAD_CMD_WR : DAD_CMD_RD); 
+　　writeb(dev->registers.addr,cpu_to_le32(bus_addr)); /*设置*/ 
+　　writeb(dev->registers.len,cpu_to_le32(count)); 
+　　/*开始操作*/ 
+　　writeb(dev->registers.command,DAD_CMD_ENABLEDMA); 
+　　return 0; 
+　　} 
+　　该函数映射了准备进行传输的缓冲区并且启动设备操作。 
+　　另一半工作必须在中断服务例程中完成，如： 
+　　void dad_interrupt(int irq,void *dev_id,struct pt_regs *regs) 
+　　{ 
+　　struct dad_dev *dev = (struct dad_dev *)dev_id; 
+　　/* 确定中断是由对应的设备发来的*/ 
+　　dma_unmap_single(dev->pci_dev->dev,dev->dma_addr, 
+　　dev->dma_size,dev->dma_dir); 
+　　/* 释放之后，才能访问缓冲区，把它拷贝给用户 */ 
+　　... 
+　　} 
+　　------------------------------------------------------------------- 
+　　ISA设备的DMA 
+　　ISA总线允许两种DMA传输:本地DMA和ISA总线控制DMA。 
+　　只讨论本地(native)DMA。***********************非常重要!!!!! 
+　　本地DMA使用主板上的标准DMA控制器电路来驱动ISA总线上的信号线。 
+　　本地DMA，要关注三种实体： 
+　　*8237 DMA控制器(DMAC) 
+　　控制器保存了有关DMA传输的信息，如方向、内存地址、传输数据量大小等。 
+　　还包含了一个跟踪传送状态的计数器。 
+　　当控制器接收到一个DMA请求信号时，它将获得总线控制权并驱动信号线， 
+　　这样设备就能读写数据了。 
+　　*外围设备 
+　　当设备准备传送数据时，必须激活DMA请求信号。 
+　　DMAC负责管理实际的传输工作；当控制器选通设备后， 
+　　硬件设备就可以顺序地读/写总线上的数据。 
+　　当传输结束时，设备通常会产生一个中断。 
+　　*设备驱动程序 
+　　设备驱动程序完成的工作很少， 
+　　它只是负责提供DMA控制器的方向、总线地址、传输量的大小等。 
+　　它还与外围设备通信，做好传输数据的准备，当DMA传输完毕后，响应中断。 
+　　在PC中使用的早期DMA控制器能够管理四个“通道”， 
+　　每个通道都与一套DMA寄存器相关联。 
+　　DMA控制器是系统资源，因此，内核协助处理这一资源。 
+　　内核使用DMA注册表为DMA通道提供了请求/释放机制， 
+　　并且提供了一组函数在DMA控制器中配置通道信息。 
+　　------------------------ 
+　　注册DMA 
+　　 
+　　int request_dma(unsigned int channel,const char *name); 
+　　void free_dma(unsigned int channel); 
+　　在open操作时请求通道，比在模块初始化函数中请求通道要好一些。 
+　　注意： 
+　　使用DMA的每个设备需要一根IRQ线，否则它将无法通知数据已经传输完毕。 
+　　open 
+　　------ 
+　　int dad_open(struct inode *inode,struct file *filp) 
+　　{ 
+　　sturct dad_device *my_device; 
+　　... 
+　　if((error = request_irq(my_device.irq,dad_interrupt, 
+　　SA_INTERRUPT,"dad",NULL))) 
+　　return error; 
+　　if((error = request_dma(my_device.dma,"dad"))) 
+　　{ 
+　　free_irq(my_device.irq,NULL); 
+　　return error; 
+　　} 
+　　... 
+　　return 0; 
+　　} 
+　　close 
+　　------- 
+　　void dad_close(struct inode *inode,struct file *filp) 
+　　{ 
+　　struct dad_device *my_device; 
+　　... 
+　　free_dma(my_device.dma); 
+　　free_irq(my_device.irq,NULL); 
+　　... 
+　　} 
+　　------------------------- 
+　　与DMA控制器通信 
+　　注册之后，驱动程序的主要任务包括为适当的操作配置DMA控制器。 
+　　幸运的是，内核导出了驱动程序所需要的所有函数。 
+　　当read或者write函数被调用时，或者准备异步传输时， 
+　　驱动程序都要对DMA控制器进行配置。 
+　　unsigned long claim_dma_lock(); 获得DMA自旋锁 
+　　void release_dma_lock(unsigned long flags); 返回DMA自旋锁 
+　　[/b] 
+　　[b]void set_dma_mode(unsigned int channel,char mode); 
+　　表明是从设备读入通道(DMA_MODE_READ),还是向设备写入数据(DMA_MODE_WRITE)。 
+　　void set_dma_addr(unsigned int channel,unsigned int addr); 
+　　为DMA缓冲区分配地址。该函数将addr的最低24位存储到控制器中。 
+　　addr参数必须是总线地址。 
+　　void set_dma_count(unsigned int channel,unsigned int count); 
+　　为传输的字节量赋值。 
+　　void disable_dma(unsigned int channel); 
+　　控制器内的DMA通道可以被禁用。 
+　　void enable_dma(unsigned int channel); 
+　　该函数告诉控制器，DMA通道包含了合法的数据。 
+　　int get_dma_residue(unsigned int channel); 
+　　驱动程序有时需要知道DMA传输是否已经结束。 
+　　该函数返回还未传输的字节数。 
+　　void clear_dma_ff(unsigned int channel); 
+　　该函数清除了DMA的触发器。 
+　　使用这些函数，驱动程序可以实现如下函数，为DMA传输做准备： 
+　　---------------------------- 
+　　int dad_dma_prepare(int channel,int mode,unsigned int buf, 
+　　unsigned int count) 
+　　{ 
+　　unsigned long flags; 
+　　flags = claim_dma_lock(); 
+　　disable_dma(channel); 
+　　clear_dma_ff(channel); 
+　　set_dma_mode(channel,mode); 
+　　set_dma_addr(channel,virt_to_bus(buf)); 
+　　set_dma_count(channel,count); 
+　　enable_dma(channel); 
+　　release_dma_lock(flags); 
+　　return 0; 
+　　} 
+　　下面代码用来检验是否完成DMA: 
+　　int dad_dma_isdone(int channel) 
+　　{ 
+　　int residue; 
+　　unsigned long flags = claim_dma_lock(); 
+　　residue = get_dma_residue(channel); 
+　　release_dma_lock(flags); 
+　　return (residue == 0); 
+　　} 
